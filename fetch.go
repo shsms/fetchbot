@@ -5,6 +5,7 @@
 package fetchbot
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/temoto/robotstxt-go"
+	"golang.org/x/sync/semaphore"
 )
 
 var (
@@ -97,6 +99,9 @@ type Fetcher struct {
 	// concurrent access to the hosts field.
 	mu    sync.Mutex
 	hosts map[string]chan Command
+
+	// ThreadsPerSite is the number of concurrent workers for the same site.
+	ThreadsPerSite int64
 }
 
 // The DebugInfo holds information to introspect the Fetcher's state.
@@ -354,8 +359,11 @@ func (f *Fetcher) processChan(ch <-chan Command, hostKey string) {
 		wait  <-chan time.Time
 		ttl   <-chan time.Time
 		delay = f.CrawlDelay
+		sema  *semaphore.Weighted
 	)
-
+	if f.ThreadsPerSite > 1 {
+		sema = semaphore.NewWeighted(f.ThreadsPerSite)
+	}
 loop:
 	for {
 		select {
@@ -392,10 +400,20 @@ loop:
 
 			case agent == nil || agent.Test(v.URL().Path):
 				// Path allowed, process the request
-				res, err := f.doRequest(v)
-				f.visit(v, res, err)
+				var err error
+				if f.ThreadsPerSite > 1 {
+					sema.Acquire(context.Background(), 1)
+					go func() {
+						res, err := f.doRequest(v)
+						f.visit(v, res, err)
+						sema.Release(1)
+					}()
+				} else {
+					res, err := f.doRequest(v)
+					f.visit(v, res, err)
+				}
 				// No delay on error - the remote host was not reached
-				if err == nil {
+				if f.ThreadsPerSite <= 1 && err == nil {
 					wait = time.After(delay)
 				} else {
 					wait = nil
